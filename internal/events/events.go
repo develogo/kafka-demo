@@ -1,4 +1,4 @@
-// Package events defines the messages the demo services exchange.
+// Package events defines the events the demo services exchange.
 //
 // Topics are per aggregate (see docs/adr/0001), so a single topic carries
 // several event types and every consumer has to route on the event type
@@ -46,7 +46,7 @@ func AllTopics() []string {
 // HeaderEventType carries Envelope.EventType as a record header so a consumer
 // can decide whether a record is for it without decoding the value. The
 // envelope mirrors it on purpose: the header serves routing, the field keeps
-// the message self-describing once it leaves Kafka.
+// the record self-describing once it leaves Kafka.
 const HeaderEventType = "event_type"
 
 // Envelope is the shape of every record value. EventID, OrderID and OccurredAt
@@ -99,6 +99,16 @@ type Shipment struct {
 // Outcome is the payload of the two terminal order events.
 type Outcome struct {
 	Reason string `json:"reason"`
+}
+
+// BRL renders cents as currency. Money is stored and carried as an integer
+// number of cents, and only ever becomes a string for a human to read.
+func BRL(cents int64) string {
+	sign := ""
+	if cents < 0 {
+		sign, cents = "-", -cents
+	}
+	return fmt.Sprintf("%sBRL %d.%02d", sign, cents/100, cents%100)
 }
 
 // TotalCents sums the lines of an order.

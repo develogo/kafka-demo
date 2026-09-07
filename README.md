@@ -47,17 +47,19 @@ give them one), then runs the five services as goroutines, each with its own
 Kafka client and consumer group. Output is one line per event:
 
 ```
-🛒 order-service        | ORD-0001  -> orders/OrderCreated            p2 @4   BRL 899.00
-💳 payment-service      | ORD-0001  <- orders/OrderCreated            p2 @4   BRL 899.00
-💳 payment-service      | ORD-0001  -> payments/PaymentApproved       p2 @2   BRL 899.00 charged
-📦 inventory-service    | ORD-0001  <- payments/PaymentApproved       p2 @2   reserving stock
-🛒 order-service        | ORD-0001   x payments/PaymentApproved       p2 @2   not for this service
+🛒 order-service        | ORD-c7cc-0003  -> orders/OrderCreated        p0 @10  BRL 38997.00
+💳 payment-service      | ORD-c7cc-0003  <- orders/OrderCreated        p0 @10  BRL 38997.00
+💳 payment-service      | ORD-c7cc-0003  -> payments/PaymentRejected   p0 @5   above the BRL 5000.00 limit
+📦 inventory-service    | ORD-c7cc-0003   x payments/PaymentRejected   p0 @5   nothing to reserve for this type
+🛒 order-service        | ORD-c7cc-0003  <- payments/PaymentRejected   p0 @5   closing the order
+🛒 order-service        | ORD-c7cc-0003  -> orders/OrderCancelled      p0 @11  above the BRL 5000.00 limit
 ```
 
 `->` published, `<-` consumed and acted on, ` x` consumed and ignored. The greyed
 out `x` lines are the point of aggregate topics: every consumer of a topic
-receives every type on it. `pN @M` is the partition and offset the record
-occupies.
+receives every type on it, and filtering is the application's job. `pN @M` is
+the partition and offset the record occupies. The middle segment of an order id
+names the run that placed it.
 
 The third order of every five is deliberately expensive, so both the approved
 and the rejected branch show up on every run, always in the same place.
@@ -90,9 +92,14 @@ The Kafka topology is identical either way.
 
 A group with no committed offsets starts at the beginning of the log, and
 offsets are committed as it goes — so a second run resumes rather than replays.
-Delivery is at-least-once: `order-service` only closes orders it placed in the
-current run, which is what stops it re-emitting terminal events for orders left
-on the topic by an earlier run.
+
+Delivery is still at-least-once, and a run that exits before its last offsets
+are committed leaves records behind for the next one to re-read. That is why an
+order id names the run that placed it (`ORD-c7cc-0003`): order numbers restart
+at 1 every run, so without the run label a replayed `ShipmentDispatched` would
+look like it belonged to an order the current run had just placed, and
+`order-service` would close the wrong one. Replays now show up as skipped,
+labelled `placed by an earlier run`.
 
 To start from a clean slate:
 

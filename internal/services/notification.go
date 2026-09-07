@@ -20,12 +20,12 @@ func RunNotification(ctx context.Context, cfg Config) error {
 	defer consumer.Close()
 
 	return consumer.Run(ctx, func(ctx context.Context, r kafkax.Record) error {
-		log.Received(r, message(r.EventType))
+		log.Received(r, customerCopy(r.EventType))
 		return nil
 	})
 }
 
-func message(t events.Type) string {
+func customerCopy(t events.Type) string {
 	switch t {
 	case events.OrderCreated:
 		return "email: we received your order"

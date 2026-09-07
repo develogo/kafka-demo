@@ -29,7 +29,7 @@ func RunShipping(ctx context.Context, cfg Config) error {
 
 	return consumer.Run(ctx, func(ctx context.Context, r kafkax.Record) error {
 		if r.EventType != events.InventoryReserved {
-			log.Skipped(r)
+			log.Skipped(r, "no action for this event type")
 			return nil
 		}
 		log.Received(r, "booking a carrier")

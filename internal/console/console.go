@@ -80,8 +80,8 @@ func (l *Logger) Received(r kafkax.Record, detail string) {
 // Skipped records an event this service consumed and ignored. Every consumer
 // of an aggregate topic sees every type on it; filtering is the application's
 // job, and these greyed-out lines are the proof.
-func (l *Logger) Skipped(r kafkax.Record) {
-	l.write(dim, arrowSkip, r, "not for this service")
+func (l *Logger) Skipped(r kafkax.Record, reason string) {
+	l.write(dim, arrowSkip, r, reason)
 }
 
 // Note prints a service-level line unattached to any record.
@@ -99,19 +99,10 @@ func (l *Logger) write(body *color.Color, arrow string, r kafkax.Record, detail 
 
 	dim.Fprintf(color.Output, "%s ", time.Now().Format("15:04:05.000"))
 	l.c.Fprintf(color.Output, "%s %-21s", l.icon, l.name)
-	body.Fprintf(color.Output, "| %-9s %s %-34s p%d @%-4d",
+	body.Fprintf(color.Output, "| %-14s %s %-34s p%d @%-4d",
 		r.Envelope.OrderID, arrow, r.Topic+"/"+string(r.EventType), r.Partition, r.Offset)
 	if detail != "" {
 		dim.Fprintf(color.Output, "  %s", detail)
 	}
 	fmt.Fprintln(color.Output)
-}
-
-// BRL formats cents as currency. Money never travels or prints as a float.
-func BRL(cents int64) string {
-	sign := ""
-	if cents < 0 {
-		sign, cents = "-", -cents
-	}
-	return fmt.Sprintf("%sBRL %d.%02d", sign, cents/100, cents%100)
 }

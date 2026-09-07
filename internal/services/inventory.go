@@ -31,7 +31,7 @@ func RunInventory(ctx context.Context, cfg Config) error {
 	return consumer.Run(ctx, func(ctx context.Context, r kafkax.Record) error {
 		// A rejected payment reserves nothing; order-service handles it.
 		if r.EventType != events.PaymentApproved {
-			log.Skipped(r)
+			log.Skipped(r, "nothing to reserve for this event type")
 			return nil
 		}
 		log.Received(r, "reserving stock")
