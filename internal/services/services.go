@@ -1,6 +1,7 @@
-// Package services holds the five participants of the order saga. Each one is
-// an independent consumer group that reacts to the events it cares about and
-// publishes what happens next.
+// Package services holds the participants of the order saga. Each one is an
+// independent consumer group with its own Postgres schema: it reacts to the
+// events it cares about, records what it did, and writes what happens next to
+// its outbox.
 package services
 
 import (
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/develogo/kafka-demo/internal/console"
+	"github.com/develogo/kafka-demo/internal/db"
 	"github.com/develogo/kafka-demo/internal/events"
 	"github.com/develogo/kafka-demo/internal/kafkax"
 )
@@ -20,15 +22,19 @@ import (
 // binaries configure them the same way.
 type Config struct {
 	Brokers          []string
+	Postgres         string // DSN; the user in it is replaced per service
 	Printer          *console.Printer
-	Orders           int           // orders to place; 0 keeps going until interrupted
-	Interval         time.Duration // delay between orders
-	RejectAboveCents int64         // payment rejects anything above this total
+	RejectAboveCents int64  // payment rejects anything above this total
+	APIAddr          string // where order-service serves the front end
 }
 
 // DefaultRejectAboveCents is the payment limit the demo ships with. The
-// catalog is built so that exactly one order in five sits above it.
+// expensive order the front can place sits above it; the standard one does not.
 const DefaultRejectAboveCents int64 = 500_000
+
+// DefaultAPIAddr is where order-service listens, and what web/next.config.ts
+// proxies to.
+const DefaultAPIAddr = "localhost:8090"
 
 // Latency each service pretends to spend on its work, so the chain unfolds at
 // a readable pace instead of all at once.
@@ -52,17 +58,17 @@ func pause(ctx context.Context, d time.Duration) error {
 // Flags registers the shared configuration on fs.
 func Flags(fs *flag.FlagSet) func() Config {
 	brokers := fs.String("brokers", kafkax.DefaultBroker, "Kafka bootstrap server")
-	orders := fs.Int("orders", 5, "orders to place (0 = until interrupted)")
-	interval := fs.Duration("interval", 1500*time.Millisecond, "delay between orders")
+	postgres := fs.String("postgres", db.DefaultDSN, "Postgres DSN (the user is replaced per service)")
 	rejectAbove := fs.Int64("reject-above-cents", DefaultRejectAboveCents, "payment rejects orders above this total, in cents")
+	apiAddr := fs.String("api", DefaultAPIAddr, "address order-service serves the API on")
 
 	return func() Config {
 		return Config{
 			Brokers:          []string{*brokers},
+			Postgres:         *postgres,
 			Printer:          console.NewPrinter(),
-			Orders:           *orders,
-			Interval:         *interval,
 			RejectAboveCents: *rejectAbove,
+			APIAddr:          *apiAddr,
 		}
 	}
 }

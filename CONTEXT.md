@@ -1,8 +1,9 @@
 # Order Saga
 
-A demo of a distributed e-commerce order flow on Kafka. Five Go services react
-to each other's events to take an order from placed to completed (or
-cancelled), with no service calling another directly.
+A demo of a distributed e-commerce order flow on Kafka. Services react to each
+other's events to take an order from placed to completed (or cancelled), with
+no service calling another directly. Each keeps its own state in Postgres, so
+the flow is visible as data as well as as a log.
 
 ## Language
 
@@ -15,6 +16,12 @@ _Avoid_: Purchase, transaction, cart, checkout
 The identifier of an Order and the partition key of every event about it, so
 one order's events stay ordered across all topics.
 _Avoid_: Correlation ID, request ID
+
+**Order Status**:
+Where an Order currently sits in its lifecycle. Only the Order's owner and the
+Projection record it; every other service knows its own aggregate, not the
+Order's status.
+_Avoid_: State, stage, phase, step
 
 **Event**:
 A statement that something already happened, named in the past tense
@@ -39,7 +46,8 @@ _Avoid_: Channel, queue, stream, event topic
 
 **Service**:
 One participant of the saga: one consumer group, one set of subscribed topics,
-and the events it publishes in response.
+one Postgres schema it alone may write, and the events it publishes in
+response.
 _Avoid_: Worker, handler, microservice, node
 
 **Saga**:
@@ -52,14 +60,36 @@ _Avoid_: Workflow, pipeline, orchestration, process manager
 produce.
 _Avoid_: Final state, closing event, result
 
+## Writing events down
+
+**Outbox**:
+Events a Service has decided to publish, written in the same transaction as the
+state change that caused them. A Service publishes nothing directly; it writes
+to its Outbox and is done.
+_Avoid_: Queue, buffer, spool, pending events, event log
+
+**Relay**:
+The loop that reads a Service's Outbox in order, publishes each event to Kafka,
+and marks it published. One per Service, and the only thing that talks to a
+producer.
+_Avoid_: Dispatcher, publisher, pump, forwarder, worker
+
+**Projection**:
+The one place an Order's whole lifecycle is visible, rebuilt purely from the
+events on the four topics. It owns no part of the saga and nothing reacts to
+it: it exists to be read.
+_Avoid_: Read model, view, cache, materialized view, aggregator
+
 ## Order lifecycle
+
+The values of Order Status, in the order they occur.
 
 **Placed**:
 `OrderCreated` is on the `orders` topic and nothing has acted on it yet.
 
 **Approved / Rejected**:
 Payment decided. Above the payment limit an order is always rejected, which is
-what makes the failure branch appear on every run.
+what makes the failure branch reachable on demand.
 
 **Reserved**:
 Stock is held for an approved order.

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/develogo/kafka-demo/internal/events"
 	"github.com/develogo/kafka-demo/internal/kafkax"
 	"github.com/fatih/color"
 )
@@ -14,8 +15,13 @@ import (
 const (
 	arrowPublish = "->"
 	arrowConsume = "<-"
+	arrowOutbox  = "=>"
 	arrowSkip    = " x"
 )
+
+// nameWidth fits the longest label, which is a relay's ("inventory-service
+// relay").
+const nameWidth = 23
 
 var styles = map[string]struct {
 	icon string
@@ -26,6 +32,7 @@ var styles = map[string]struct {
 	"inventory-service":    {"📦", color.FgHiYellow},
 	"shipping-service":     {"🚚", color.FgHiMagenta},
 	"notification-service": {"🔔", color.FgHiBlue},
+	"projection-service":   {"🗂️", color.FgHiRed},
 }
 
 var (
@@ -33,8 +40,8 @@ var (
 	plain = color.New(color.FgWhite)
 )
 
-// Printer serialises the output of the five services, which in the combined
-// demo all write to the same terminal from their own goroutines.
+// Printer serialises the output of the services, which in the combined demo
+// all write to the same terminal from their own goroutines.
 type Printer struct{ mu sync.Mutex }
 
 func NewPrinter() *Printer { return &Printer{} }
@@ -67,7 +74,26 @@ type Logger struct {
 	c    *color.Color
 }
 
-// Published records an event this service just wrote to a topic.
+// Relay returns the logger of this service's outbox relay. It keeps the
+// service's colour: the two are one process, and the gap between the service's
+// outbox line and the relay's publish line is the latency the pattern costs.
+func (l *Logger) Relay() *Logger {
+	return &Logger{p: l.p, name: l.name + " relay", icon: "📮", c: l.c}
+}
+
+// Outboxed records an event a service wrote to its outbox. It has no partition
+// or offset yet: nothing has reached Kafka.
+func (l *Logger) Outboxed(topic string, env events.Envelope, detail string) {
+	l.p.mu.Lock()
+	defer l.p.mu.Unlock()
+	l.prefix()
+	l.c.Fprintf(color.Output, "| %-12s %s %-34s outbox   ",
+		events.ShortID(env.OrderID), arrowOutbox, topic+"/"+string(env.EventType))
+	l.detail(detail)
+}
+
+// Published records an event that reached a topic. Only a relay calls this:
+// services publish nothing directly.
 func (l *Logger) Published(r kafkax.Record, detail string) {
 	l.write(l.c, arrowPublish, r, detail)
 }
@@ -88,19 +114,28 @@ func (l *Logger) Skipped(r kafkax.Record, reason string) {
 func (l *Logger) Note(format string, a ...any) {
 	l.p.mu.Lock()
 	defer l.p.mu.Unlock()
-	dim.Fprintf(color.Output, "%s ", time.Now().Format("15:04:05.000"))
-	l.c.Fprintf(color.Output, "%s %-21s", l.icon, l.name)
+	l.prefix()
 	plain.Fprintf(color.Output, "| "+format+"\n", a...)
 }
 
 func (l *Logger) write(body *color.Color, arrow string, r kafkax.Record, detail string) {
 	l.p.mu.Lock()
 	defer l.p.mu.Unlock()
+	l.prefix()
+	body.Fprintf(color.Output, "| %-12s %s %-34s p%d @%-4d",
+		events.ShortID(r.Envelope.OrderID), arrow, r.Topic+"/"+string(r.EventType), r.Partition, r.Offset)
+	l.detail(detail)
+}
 
+// prefix writes the timestamp and the service label. The caller holds the lock.
+func (l *Logger) prefix() {
 	dim.Fprintf(color.Output, "%s ", time.Now().Format("15:04:05.000"))
-	l.c.Fprintf(color.Output, "%s %-21s", l.icon, l.name)
-	body.Fprintf(color.Output, "| %-14s %s %-34s p%d @%-4d",
-		r.Envelope.OrderID, arrow, r.Topic+"/"+string(r.EventType), r.Partition, r.Offset)
+	l.c.Fprintf(color.Output, "%s %-*s", l.icon, nameWidth, l.name)
+}
+
+// detail closes a line with its greyed-out trailing note. The caller holds the
+// lock.
+func (l *Logger) detail(detail string) {
 	if detail != "" {
 		dim.Fprintf(color.Output, "  %s", detail)
 	}

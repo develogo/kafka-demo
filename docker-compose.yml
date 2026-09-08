@@ -28,6 +28,28 @@ services:
       retries: 10
       start_period: 20s
 
+  postgres:
+    image: postgres:18
+    container_name: kafka-demo-postgres
+    ports:
+      # 5434 on the host: 5432 and 5433 were both taken on the development
+      # machine, the same reason Kafka UI sits on 8082.
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: kafkademo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      # Postgres 18 images keep the data one level up from where 17 did.
+      - postgres-data:/var/lib/postgresql
+      # Roles and schemas, one per service. Runs once, on an empty volume.
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d kafkademo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   kafka-ui:
     image: kafbat/kafka-ui:latest
     container_name: kafka-ui
@@ -43,3 +65,4 @@ services:
 
 volumes:
   kafka-data:
+  postgres-data:
