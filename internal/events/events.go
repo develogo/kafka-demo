@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Type identifies what happened. It is the routing key of the whole demo.
@@ -153,4 +155,82 @@ func newEventID() string {
 		panic(fmt.Sprintf("events: cannot generate event id: %v", err))
 	}
 	return "evt_" + hex.EncodeToString(b[:])
+}
+
+// Status is where an order sits in its lifecycle. Only the order's owner and
+// the projection record it; every other service knows its own aggregate.
+type Status string
+
+const (
+	StatusPlaced     Status = "PLACED"
+	StatusApproved   Status = "APPROVED"
+	StatusRejected   Status = "REJECTED"
+	StatusReserved   Status = "RESERVED"
+	StatusDispatched Status = "DISPATCHED"
+	StatusCompleted  Status = "COMPLETED"
+	StatusCancelled  Status = "CANCELLED"
+)
+
+// statusOf is the status each event puts an order in. Types absent from the
+// map move nothing.
+var statusOf = map[Type]Status{
+	OrderCreated:       StatusPlaced,
+	PaymentApproved:    StatusApproved,
+	PaymentRejected:    StatusRejected,
+	InventoryReserved:  StatusReserved,
+	ShipmentDispatched: StatusDispatched,
+	OrderCompleted:     StatusCompleted,
+	OrderCancelled:     StatusCancelled,
+}
+
+// StatusFor reports the status t moves an order to, if any.
+func StatusFor(t Type) (Status, bool) {
+	s, ok := statusOf[t]
+	return s, ok
+}
+
+// rank orders the lifecycle. Approved and rejected share a rank because they
+// are the two outcomes of the same step, as do the two terminal statuses.
+var rank = map[Status]int{
+	StatusPlaced: 1, StatusApproved: 2, StatusRejected: 2,
+	StatusReserved: 3, StatusDispatched: 4,
+	StatusCompleted: 5, StatusCancelled: 5,
+}
+
+// Advances reports whether s is a step forward from current. Delivery is
+// at-least-once and topics are ordered only per partition, so a projection can
+// see a late event for a step it has already passed; this is what keeps it
+// from moving an order backwards.
+func (s Status) Advances(current Status) bool {
+	return rank[s] > rank[current]
+}
+
+// Terminal reports whether an order in this status will produce nothing
+// further.
+func (s Status) Terminal() bool {
+	return s == StatusCompleted || s == StatusCancelled
+}
+
+// NewOrderID mints the identifier of an order. UUIDv7 is time-ordered, so ids
+// sort by when the order was placed, and unique across runs by construction --
+// which is why nothing has to label the run that placed an order.
+func NewOrderID() string {
+	id, err := uuid.NewV7()
+	if err != nil {
+		// Same reasoning as newEventID: an order without an id is worse than
+		// a crash.
+		panic(fmt.Sprintf("events: cannot generate order id: %v", err))
+	}
+	return id.String()
+}
+
+// ShortID is the tail of an id, for a terminal line that has to stay narrow.
+// The tail and not the head: the head of a UUIDv7 is a timestamp, so two
+// orders placed a minute apart share it.
+func ShortID(id string) string {
+	const n = 12
+	if len(id) <= n {
+		return id
+	}
+	return id[len(id)-n:]
 }

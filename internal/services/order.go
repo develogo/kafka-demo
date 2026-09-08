@@ -2,21 +2,34 @@ package services
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/develogo/kafka-demo/internal/console"
 	"github.com/develogo/kafka-demo/internal/events"
 	"github.com/develogo/kafka-demo/internal/kafkax"
+	"github.com/develogo/kafka-demo/internal/outbox"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// errDone unwinds the consume loop once every order this run placed has
-// reached a terminal state.
-var errDone = errors.New("all orders settled")
+const ordersSchema = "orders"
 
-// catalog is fixed so two runs of the demo produce the same story.
+// order-service is the only service whose table carries a status, because it
+// is the only one that owns the order. The statuses in between belong to the
+// projection: this service never learns that stock was reserved.
+const ordersDDL = `
+CREATE TABLE IF NOT EXISTS orders.orders (
+    id          uuid        PRIMARY KEY,
+    customer_id text        NOT NULL,
+    items       jsonb       NOT NULL,
+    total_cents bigint      NOT NULL,
+    status      text        NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);`
+
+// catalog is what a standard order is drawn from, one item per order, in turn.
 var catalog = []events.Item{
 	{SKU: "SKU-HEADSET", Name: "Noise-Cancelling Headset", Quantity: 1, UnitCents: 89900},
 	{SKU: "SKU-COFFEE", Name: "Espresso Machine", Quantity: 1, UnitCents: 129900},
@@ -25,193 +38,98 @@ var catalog = []events.Item{
 	{SKU: "SKU-MONITOR", Name: "4K Monitor", Quantity: 1, UnitCents: 199900},
 }
 
-// bigTicket is the order that trips the payment limit.
+// bigTicket sits above the payment limit, so the order built from it is always
+// rejected. It is what the front's second button places: the failure branch is
+// the customer's choice rather than something hidden in a counter.
 var bigTicket = events.Item{SKU: "SKU-LAPTOP", Name: "Workstation Laptop", Quantity: 3, UnitCents: 1_299_900}
 
-// bigTicketEvery makes the third order of every five deliberately expensive,
-// so both the approved and the rejected branch show up on every run, always in
-// the same place.
-const bigTicketEvery = 5
-const bigTicketIndex = 2
+// placed counts the orders this process has taken, so consecutive clicks buy
+// different things.
+var placed atomic.Int64
 
-// RunOrder places orders and closes their lifecycle: it consumes payments and
-// shipments, and publishes the terminal OrderCancelled / OrderCompleted back
-// onto the orders topic. That is what makes orders carry three event types and
-// forces payment-service to route by type rather than by topic.
+// RunOrder serves the API and closes the lifecycle of the orders it took: it
+// consumes payments and shipments and writes the terminal OrderCancelled /
+// OrderCompleted back onto the orders topic. That is what makes orders carry
+// three event types and forces payment-service to route by type rather than by
+// topic.
 func RunOrder(ctx context.Context, cfg Config) error {
-	const name = "order-service"
-	log := cfg.Printer.For(name)
+	return participant{
+		name:      "order-service",
+		schema:    ordersSchema,
+		ddl:       ordersDDL + outbox.DDL(ordersSchema),
+		topics:    []string{events.TopicPayments, events.TopicShipments},
+		publishes: true,
+		handle:    closeOrder,
+		alongside: func(ctx context.Context, pool *pgxpool.Pool, log *console.Logger) error {
+			return serveAPI(ctx, cfg.APIAddr, pool, log)
+		},
+	}.run(ctx, cfg)
+}
 
-	producer, err := kafkax.NewProducer(cfg.Brokers)
+func closeOrder(ctx context.Context, tx pgx.Tx, r kafkax.Record, log *console.Logger) ([]emission, error) {
+	var terminal events.Type
+	var reason string
+
+	switch r.EventType {
+	case events.PaymentRejected:
+		payment, err := events.Decode[events.Payment](r.Envelope)
+		if err != nil {
+			return nil, err
+		}
+		terminal, reason = events.OrderCancelled, payment.Reason
+	case events.ShipmentDispatched:
+		shipment, err := events.Decode[events.Shipment](r.Envelope)
+		if err != nil {
+			return nil, err
+		}
+		terminal, reason = events.OrderCompleted, "handed to "+shipment.Carrier
+	default:
+		// This service consumes payments and shipments, but an approval is
+		// inventory-service's business, not its own.
+		log.Skipped(r, "no action for this event type")
+		return nil, nil
+	}
+	if err := pause(ctx, orderLatency); err != nil {
+		return nil, nil
+	}
+
+	status, _ := events.StatusFor(terminal)
+	// One conditional write covers both guards: an order this database never
+	// placed does not match, and neither does one that is already closed. That
+	// is what makes a replayed terminal event a no-op, and it survives a
+	// restart in a way the in-memory guard it replaces did not.
+	tag, err := tx.Exec(ctx, `
+        UPDATE orders.orders
+           SET status = $2, updated_at = now()
+         WHERE id = $1 AND status <> $3 AND status <> $4`,
+		r.Envelope.OrderID, string(status), string(events.StatusCompleted), string(events.StatusCancelled))
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("close order: %w", err)
 	}
-	defer producer.Close()
+	if tag.RowsAffected() == 0 {
+		log.Skipped(r, "unknown order, or already closed")
+		return nil, nil
+	}
+	log.Received(r, "closing the order")
 
-	consumer, err := kafkax.NewConsumer(cfg.Brokers, name, events.TopicPayments, events.TopicShipments)
+	env, err := events.New(terminal, r.Envelope.OrderID, events.Outcome{Reason: reason})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer consumer.Close()
-
-	run := newRunID()
-	placed := &openOrders{ids: map[string]struct{}{}, total: cfg.Orders}
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var producing sync.WaitGroup
-	producing.Add(1)
-	go func() {
-		defer producing.Done()
-		if err := placeOrders(ctx, cfg, run, producer, log, placed); err != nil && ctx.Err() == nil {
-			log.Note("stopped placing orders: %v", err)
-		}
-	}()
-
-	err = consumer.Run(ctx, func(ctx context.Context, r kafkax.Record) error {
-		var terminal events.Type
-		var reason string
-
-		switch r.EventType {
-		case events.PaymentRejected:
-			payment, err := events.Decode[events.Payment](r.Envelope)
-			if err != nil {
-				return err
-			}
-			terminal, reason = events.OrderCancelled, payment.Reason
-		case events.ShipmentDispatched:
-			shipment, err := events.Decode[events.Shipment](r.Envelope)
-			if err != nil {
-				return err
-			}
-			terminal, reason = events.OrderCompleted, "handed to "+shipment.Carrier
-		default:
-			// This service consumes payments and shipments, but an approval
-			// is inventory-service's business, not its own.
-			log.Skipped(r, "no action for this event type")
-			return nil
-		}
-
-		// Delivery is at-least-once. An order id names the run that placed it,
-		// so a terminal event replayed from an earlier run is not ours to
-		// close and must not count towards this run finishing.
-		if !placed.owns(r.Envelope.OrderID) {
-			log.Skipped(r, "placed by an earlier run")
-			return nil
-		}
-		log.Received(r, "closing the order")
-
-		if err := pause(ctx, orderLatency); err != nil {
-			return nil
-		}
-		env, err := events.New(terminal, r.Envelope.OrderID, events.Outcome{Reason: reason})
-		if err != nil {
-			return err
-		}
-		published, err := producer.Publish(ctx, events.TopicOrders, env)
-		if err != nil {
-			return err
-		}
-		log.Published(published, reason)
-
-		if placed.settle(r.Envelope.OrderID) {
-			return errDone
-		}
-		return nil
-	})
-	// Stop placing orders and let that goroutine unwind before the deferred
-	// Close pulls the producer out from under it.
-	cancel()
-	producing.Wait()
-
-	if errors.Is(err, errDone) {
-		return nil
-	}
-	return err
+	return []emission{{topic: events.TopicOrders, env: env, detail: reason}}, nil
 }
 
-func placeOrders(ctx context.Context, cfg Config, run string, producer *kafkax.Producer, log *console.Logger, placed *openOrders) error {
-	for i := 0; cfg.Orders == 0 || i < cfg.Orders; i++ {
-		if err := pause(ctx, cfg.Interval); err != nil {
-			return nil
-		}
-
-		id := orderID(run, i)
-		order := buildOrder(i)
-		placed.track(id)
-
-		env, err := events.New(events.OrderCreated, id, order)
-		if err != nil {
-			return err
-		}
-		published, err := producer.Publish(ctx, events.TopicOrders, env)
-		if err != nil {
-			return err
-		}
-		log.Published(published, events.BRL(order.TotalCents))
-	}
-	return nil
-}
-
-// newRunID labels the orders of one run. Order numbers restart at 1 every
-// run, so without it a record replayed from an earlier run would carry an id
-// the current run is also using, and order-service would close the wrong
-// order.
-func newRunID() string {
-	return fmt.Sprintf("%04x", time.Now().UnixNano()&0xffff)
-}
-
-// orderID names the i-th order of a run.
-func orderID(run string, i int) string {
-	return fmt.Sprintf("ORD-%s-%04d", run, i+1)
-}
-
-// buildOrder is deterministic: order i always has the same contents.
-func buildOrder(i int) events.Order {
-	items := []events.Item{catalog[i%len(catalog)]}
-	if i%bigTicketEvery == bigTicketIndex {
+// buildOrder is the mocked basket behind a button. A standard order walks the
+// catalog; an expensive one is always the same laptop.
+func buildOrder(expensive bool) events.Order {
+	n := placed.Add(1) - 1
+	items := []events.Item{catalog[n%int64(len(catalog))]}
+	if expensive {
 		items = []events.Item{bigTicket}
 	}
 	return events.Order{
-		CustomerID: fmt.Sprintf("CUST-%04d", i%3+1),
+		CustomerID: fmt.Sprintf("CUST-%04d", n%3+1),
 		Items:      items,
 		TotalCents: events.TotalCents(items),
 	}
-}
-
-// openOrders tracks the orders this run placed and how many are still to be
-// closed. It is also the idempotency guard: delivery is at-least-once, so a
-// terminal event must not be published twice for the same order.
-type openOrders struct {
-	mu      sync.Mutex
-	ids     map[string]struct{}
-	settled int
-	total   int // 0 means the run has no end
-}
-
-func (l *openOrders) track(id string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.ids[id] = struct{}{}
-}
-
-func (l *openOrders) owns(id string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	_, ok := l.ids[id]
-	return ok
-}
-
-// settle closes an order and reports whether every order of a bounded run is
-// now done.
-func (l *openOrders) settle(id string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if _, ok := l.ids[id]; !ok {
-		return false
-	}
-	delete(l.ids, id)
-	l.settled++
-	return l.total > 0 && l.settled >= l.total
 }

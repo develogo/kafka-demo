@@ -101,12 +101,17 @@ type Consumer struct {
 // NewConsumer joins group and subscribes to topics. A group with no committed
 // offsets starts at the beginning of the log; offsets are committed as it
 // goes, so restarting resumes instead of replaying.
+//
+// Auto-commit is off: an offset must not move past a record whose Postgres
+// transaction has not committed, or the event is lost rather than merely
+// repeated. Run commits after the handler returns.
 func NewConsumer(brokers []string, group string, topics ...string) (*Consumer, error) {
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topics...),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("consumer %s: connect to %v: %w", group, brokers, err)
@@ -115,6 +120,8 @@ func NewConsumer(brokers []string, group string, topics ...string) (*Consumer, e
 }
 
 // Run polls until ctx is cancelled, the client is closed, or handle fails.
+// Records whose handler returned are committed as a batch; a record the
+// handler failed on, and everything after it, is not.
 func (c *Consumer) Run(ctx context.Context, handle func(context.Context, Record) error) error {
 	for {
 		fetches := c.cl.PollFetches(ctx)
@@ -126,6 +133,7 @@ func (c *Consumer) Run(ctx context.Context, handle func(context.Context, Record)
 		}
 
 		var handleErr error
+		var handled []*kgo.Record
 		fetches.EachRecord(func(r *kgo.Record) {
 			if handleErr != nil {
 				return
@@ -139,21 +147,37 @@ func (c *Consumer) Run(ctx context.Context, handle func(context.Context, Record)
 			if eventType == "" {
 				eventType = env.EventType
 			}
-			handleErr = handle(ctx, Record{
+			if err := handle(ctx, Record{
 				Topic:     r.Topic,
 				Partition: r.Partition,
 				Offset:    r.Offset,
 				EventType: eventType,
 				Envelope:  env,
-			})
+			}); err != nil {
+				handleErr = err
+				return
+			}
+			handled = append(handled, r)
 		})
+
+		// Commit what was handled even when a later record failed, so a
+		// restart resumes at the first record that did not get through.
+		if len(handled) > 0 {
+			if err := c.cl.CommitRecords(context.WithoutCancel(ctx), handled...); err != nil {
+				if handleErr != nil {
+					return handleErr
+				}
+				return fmt.Errorf("%s: commit offsets: %w", c.group, err)
+			}
+		}
 		if handleErr != nil {
 			return handleErr
 		}
 	}
 }
 
-// Close leaves the group, committing the offsets processed so far.
+// Close leaves the group. Offsets are committed by Run as it goes, so nothing
+// is committed here that was not already processed.
 func (c *Consumer) Close() { c.cl.Close() }
 
 func headerEventType(r *kgo.Record) events.Type {
